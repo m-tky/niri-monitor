@@ -49,17 +49,14 @@ flakeのNixOS moduleはVKMS、ydotoold、ユーザーサービスをまとめて
   services.niri-android-monitor = {
     enable = true;
     user = "user";
-    adbSerial = "f2ccba87"; # 1台だけならnullでもよい
-    output = "Virtual-1";
-    width = 1920;
-    height = 1080;
-    fps = 60;
-    encoder = "auto";
-    renderNode = "/dev/dri/renderD128";
-    touch.enable = true;
   };
 }
 ```
+
+NixOS側ではサービスの有効化とデスクトップユーザーだけを指定します。解像度、fps、encoder、
+ADB serial、output名、render node、タッチ入力などの実際の設定はGUIから行います。GUIで保存した
+`~/.config/niri-android-monitor/settings.json`がNix moduleの初期値より優先されるため、設定変更の
+たびにNixOSをrebuildする必要はありません。
 
 rebuild後は、ydotool groupを反映するため一度ログアウト・ログインしてください。ユーザーサービスは
 niri IPC socketを待ってから起動し、最初に`Virtual-1`をOFFにします。Androidアプリが閉じている
@@ -87,7 +84,7 @@ GUIではデーモンを停止せずに、以下を変更できます。
 - render nodeと明示的なcustom mode
 
 設定は`~/.config/niri-android-monitor/settings.json`へ保存されます。NixOS moduleやコマンドライン
-引数は初期値として扱われ、「Nix設定へ戻す」で保存した上書きを削除できます。
+引数は初期値として扱われ、「Restore Nix defaults」で保存した上書きを削除できます。
 
 GUIとデーモンは`$XDG_RUNTIME_DIR/niri-android-monitor.sock`で通信します。socketはmode 0600で、
 同じユーザーだけが操作できます。解像度・fps・encoderなどを適用すると、デーモンのsystemd

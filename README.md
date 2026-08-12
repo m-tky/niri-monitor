@@ -31,7 +31,7 @@ flakeのNixOS moduleはVKMS、ydotoold、ユーザーサービスをまとめて
 
 ```nix
 {
-  inputs.niri-android-monitor.url = "path:/home/user/Code/niri-android-monitor";
+  inputs.niri-android-monitor.url = "github:m-tky/niri-monitor";
 
   outputs = inputs@{ nixpkgs, niri-android-monitor, ... }: {
     # nixosSystemのmodulesに追加

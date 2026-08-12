@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Niri Android Monitor Settings
+Comment=Configure the niri Android monitor daemon
+Exec=niri-android-monitor-settings
+Icon=video-display
+Terminal=false
+Categories=Settings;Utility;
+StartupNotify=true

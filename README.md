@@ -12,6 +12,35 @@ niri本体への変更と物理ダミープラグは不要です。VKMS connecto
 Androidアプリが接続している間だけniri outputを有効にします。アプリ終了、USB切断、デーモンの
 SIGINT/SIGTERM、エンコーダ異常終了のいずれでもoutputをOFFへ戻します。
 
+## Android releases
+
+Pushing a version tag such as `v0.1.0` creates a GitHub Release and attaches an optimized,
+release-signed Android APK built by GitHub Actions. R8 code shrinking, resource shrinking, and an
+English-only resource configuration keep the direct-install artifact small. The app has no native
+libraries, so ABI-specific APKs would not materially reduce its size; one optimized universal APK
+works across supported Android devices.
+
+Before the first release, configure these repository Actions secrets. Use one persistent keystore
+for every release so Android accepts updates over an already-installed APK.
+
+- `ANDROID_KEYSTORE_BASE64`: base64-encoded release keystore
+- `ANDROID_KEYSTORE_PASSWORD`
+- `ANDROID_KEY_ALIAS`
+- `ANDROID_KEY_PASSWORD`
+
+For example, generate the keystore once and encode it without line wrapping:
+
+```bash
+keytool -genkeypair -keystore niri-monitor-release.keystore -alias niri-monitor \
+  -keyalg RSA -keysize 4096 -validity 10000
+base64 -w 0 niri-monitor-release.keystore
+```
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## 省電力と遅延の方針
 
 `--fps`は最大フレームレートです。キャプチャはdamage駆動のVFRで、静止画を指定fpsまで複製

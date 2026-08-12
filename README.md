@@ -48,9 +48,15 @@ flakeのNixOS moduleはVKMS、ydotoold、ユーザーサービスをまとめて
 
   services.niri-android-monitor = {
     enable = true;
-    user = "user";
+    users = [ "user" ];
   };
 }
+```
+
+複数のユーザーが同じマシンを使う場合は、次のように指定できます。
+
+```nix
+services.niri-android-monitor.users = [ "alice" "bob" ];
 ```
 
 NixOS側ではサービスの有効化とデスクトップユーザーだけを指定します。解像度、fps、encoder、

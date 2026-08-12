@@ -3,7 +3,8 @@
 
 let
   cfg = config.services.niri-android-monitor;
-  inherit (lib) mkEnableOption mkIf mkOption optional optionals types;
+  inherit (lib) genAttrs mkEnableOption mkIf mkOption optional optionals types;
+  effectiveUsers = if cfg.user != null then [ cfg.user ] else cfg.users;
   executable = lib.getExe cfg.package;
   arguments = [
     "--output" cfg.output
@@ -45,9 +46,16 @@ in
   options.services.niri-android-monitor = {
     enable = mkEnableOption "the USB niri monitor daemon and its VKMS output";
 
+    users = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      description = "Desktop users whose graphical sessions should run the monitor service.";
+    };
+
     user = mkOption {
-      type = types.str;
-      description = "Desktop user that owns the niri session.";
+      type = types.nullOr types.str;
+      default = null;
+      description = "Deprecated single-user alias; use users instead.";
     };
 
     package = mkOption {
@@ -107,17 +115,29 @@ in
   };
 
   config = mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = effectiveUsers != [ ];
+        message = "services.niri-android-monitor.users must contain at least one user.";
+      }
+      {
+        assertion = cfg.user == null || cfg.users == [ ];
+        message = "Set either services.niri-android-monitor.user or users, not both.";
+      }
+    ];
     services.niri-android-vkms.enable = true;
     environment.systemPackages = [ cfg.package ];
 
     programs.ydotool.enable = cfg.touch.enable;
-    users.users.${cfg.user}.extraGroups = optional cfg.touch.enable config.programs.ydotool.group;
+    users.users = genAttrs effectiveUsers (_: {
+      extraGroups = optional cfg.touch.enable config.programs.ydotool.group;
+    });
 
     systemd.user.services.niri-android-monitor = {
       description = "Low-latency Android monitor for niri";
       wantedBy = [ "graphical-session.target" ];
       after = [ "graphical-session.target" ];
-      unitConfig.ConditionUser = cfg.user;
+      unitConfig.ConditionUser = effectiveUsers;
       serviceConfig = {
         ExecStart = launcher;
         Restart = "on-failure";

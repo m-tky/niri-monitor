@@ -40,6 +40,8 @@ struct Config {
     width: u32,
     height: u32,
     fps: u32,
+    position_x: Option<i32>,
+    position_y: Option<i32>,
     port: u16,
     adb_serial: Option<String>,
     touch: bool,
@@ -55,6 +57,11 @@ impl Config {
         }
         if self.output.trim().is_empty() {
             return Err("output must not be empty".into());
+        }
+        if self.position_x.is_some() != self.position_y.is_some() {
+            return Err(
+                "position_x and position_y must either both be set or both be automatic".into(),
+            );
         }
         Ok(())
     }
@@ -100,6 +107,8 @@ impl Default for Config {
             width: 1920,
             height: 1080,
             fps: 60,
+            position_x: None,
+            position_y: None,
             port: 57421,
             adb_serial: env::var("ANDROID_SERIAL").ok(),
             touch: true,
@@ -212,6 +221,12 @@ fn parse_args() -> io::Result<Config> {
             "--width" => config.width = parse(&value(&mut args, "--width")?, "width")?,
             "--height" => config.height = parse(&value(&mut args, "--height")?, "height")?,
             "--fps" => config.fps = parse(&value(&mut args, "--fps")?, "fps")?,
+            "--position-x" => {
+                config.position_x = Some(parse(&value(&mut args, "--position-x")?, "position-x")?)
+            }
+            "--position-y" => {
+                config.position_y = Some(parse(&value(&mut args, "--position-y")?, "position-y")?)
+            }
             "--port" => config.port = parse(&value(&mut args, "--port")?, "port")?,
             "--adb-serial" => config.adb_serial = Some(value(&mut args, "--adb-serial")?),
             "--no-touch" => config.touch = false,
@@ -219,7 +234,7 @@ fn parse_args() -> io::Result<Config> {
                 println!(
                     r#"niri-android-monitor [--output Virtual-1] [--mode 1920x1080@60] \
                      [--width 1920] [--height 1080] [--fps 60] [--port 57421] \
-                     [--adb-serial SERIAL] [--no-touch]"#
+                     [--position-x X --position-y Y] [--adb-serial SERIAL] [--no-touch]"#
                 );
                 std::process::exit(0);
             }
@@ -498,6 +513,7 @@ fn serve(
     niri_output(&config.output, &["custom-mode", &mode_string(config)])?;
     niri_output(&config.output, &["scale", "1"])?;
     niri_output(&config.output, &["on"])?;
+    apply_output_position(config)?;
     thread::sleep(Duration::from_millis(250));
 
     let pointer_space = query_pointer_space(config);
@@ -545,6 +561,28 @@ fn serve(
     // its capture buffers before removing the output they belonged to.
     thread::sleep(OUTPUT_RELEASE_GRACE);
     result
+}
+
+fn apply_output_position(config: &Config) -> io::Result<()> {
+    let action = output_position_action(config)?;
+    let action: Vec<_> = action.iter().map(String::as_str).collect();
+    niri_output(&config.output, &action)
+}
+
+fn output_position_action(config: &Config) -> io::Result<Vec<String>> {
+    match (config.position_x, config.position_y) {
+        (Some(x), Some(y)) => Ok(vec![
+            "position".into(),
+            "set".into(),
+            x.to_string(),
+            y.to_string(),
+        ]),
+        (None, None) => Ok(vec!["position".into(), "auto".into()]),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "output position requires both X and Y",
+        )),
+    }
 }
 
 fn write_header(stream: &mut TcpStream, config: &Config, touch_enabled: bool) -> io::Result<()> {
@@ -1152,6 +1190,35 @@ mod tests {
         assert!(args.iter().any(|arg| *arg == "libx264"));
         assert!(!args.iter().any(|arg| *arg == "h264_vaapi"));
         assert!(args.windows(2).any(|args| args == ["-f", "/dev/stdout"]));
+    }
+
+    #[test]
+    fn output_position_supports_automatic_and_signed_coordinates() {
+        let automatic = Config::default();
+        assert_eq!(
+            output_position_action(&automatic).unwrap(),
+            ["position", "auto"]
+        );
+
+        let manual = Config {
+            position_x: Some(-1524),
+            position_y: Some(240),
+            ..Config::default()
+        };
+        assert_eq!(
+            output_position_action(&manual).unwrap(),
+            ["position", "set", "-1524", "240"]
+        );
+    }
+
+    #[test]
+    fn output_position_rejects_a_single_coordinate() {
+        let config = Config {
+            position_x: Some(100),
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+        assert!(output_position_action(&config).is_err());
     }
 
     #[test]

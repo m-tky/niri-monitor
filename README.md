@@ -111,6 +111,7 @@ GUIではデーモンを停止せずに、以下を変更できます。
 
 - niri output名
 - 任意の幅・高さ・最大fps
+- 自動配置、または負数を含む任意の論理X/Y座標
 - ADB serial
 - タッチ入力
 - 明示的なcustom mode
@@ -157,7 +158,8 @@ niri msg output Virtual-1 off
 nix run . -- \
   --adb-serial f2ccba87 \
   --output Virtual-1 \
-  --width 1920 --height 1080 --fps 60
+  --width 1920 --height 1080 --fps 60 \
+  --position-x 3440 --position-y 0
 ```
 
 解像度とfpsは任意に変更できます。`--mode`を省略すると

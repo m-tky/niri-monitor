@@ -45,7 +45,7 @@ def request(payload):
 class SettingsWindow(Gtk.ApplicationWindow):
     def __init__(self, application):
         super().__init__(application=application, title="Niri Android Monitor Settings")
-        self.set_default_size(620, 610)
+        self.set_default_size(620, 680)
         self.settings = None
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
@@ -93,14 +93,30 @@ class SettingsWindow(Gtk.ApplicationWindow):
         self.fps_spin = Gtk.SpinButton.new_with_range(1, 240, 1)
         self._row(grid, 2, "Maximum FPS", self.fps_spin)
 
+        self.auto_position_switch = Gtk.Switch()
+        self.auto_position_switch.set_halign(Gtk.Align.START)
+        self.auto_position_switch.connect(
+            "notify::active", lambda *_args: self.update_position_sensitivity()
+        )
+        self._row(grid, 3, "Automatic position", self.auto_position_switch)
+
+        position = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.position_x_spin = Gtk.SpinButton.new_with_range(-100000, 100000, 1)
+        self.position_y_spin = Gtk.SpinButton.new_with_range(-100000, 100000, 1)
+        position.append(Gtk.Label(label="X"))
+        position.append(self.position_x_spin)
+        position.append(Gtk.Label(label="Y"))
+        position.append(self.position_y_spin)
+        self._row(grid, 4, "Logical position", position)
+
         self.adb_entry = Gtk.Entry()
         self.adb_entry.set_placeholder_text("Leave empty to use the only connected device")
         self.adb_entry.set_hexpand(True)
-        self._row(grid, 3, "ADB serial", self.adb_entry)
+        self._row(grid, 5, "ADB serial", self.adb_entry)
 
         self.touch_switch = Gtk.Switch()
         self.touch_switch.set_halign(Gtk.Align.START)
-        self._row(grid, 4, "Touch input", self.touch_switch)
+        self._row(grid, 6, "Touch input", self.touch_switch)
 
         advanced = Gtk.Expander(label="Advanced settings")
         advanced_grid = Gtk.Grid(column_spacing=16, row_spacing=12)
@@ -162,6 +178,11 @@ class SettingsWindow(Gtk.ApplicationWindow):
         self.width_spin.set_value(settings["width"])
         self.height_spin.set_value(settings["height"])
         self.fps_spin.set_value(settings["fps"])
+        automatic = settings.get("position_x") is None or settings.get("position_y") is None
+        self.auto_position_switch.set_active(automatic)
+        self.position_x_spin.set_value(settings.get("position_x") or 0)
+        self.position_y_spin.set_value(settings.get("position_y") or 0)
+        self.update_position_sensitivity()
         self.adb_entry.set_text(settings.get("adb_serial") or "")
         self.touch_switch.set_active(bool(settings.get("touch", True)))
         mode = settings.get("mode", "")
@@ -172,16 +193,24 @@ class SettingsWindow(Gtk.ApplicationWindow):
         if self.settings is None:
             raise RuntimeError("Settings have not been loaded yet")
         updated = dict(self.settings)
+        automatic = self.auto_position_switch.get_active()
         updated.update(
             output=self.output_entry.get_text().strip(),
             width=self.width_spin.get_value_as_int(),
             height=self.height_spin.get_value_as_int(),
             fps=self.fps_spin.get_value_as_int(),
+            position_x=None if automatic else self.position_x_spin.get_value_as_int(),
+            position_y=None if automatic else self.position_y_spin.get_value_as_int(),
             adb_serial=self.adb_entry.get_text().strip() or None,
             touch=self.touch_switch.get_active(),
             mode=self.mode_entry.get_text().strip(),
         )
         return updated
+
+    def update_position_sensitivity(self):
+        manual = not self.auto_position_switch.get_active()
+        self.position_x_spin.set_sensitive(manual)
+        self.position_y_spin.set_sensitive(manual)
 
     def on_apply(self, _button):
         try:

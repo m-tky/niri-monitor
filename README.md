@@ -3,7 +3,7 @@
 USB-connected Android deviceを、niriの低遅延サブモニターとして使う実験実装です。
 
 ```text
-VKMS / niri output → wlr-screencopy DMA-BUF → VA-API H.264
+VKMS / niri output → wlr-screencopy SHM → low-latency x264 H.264
                  → ADB reverse → MediaCodec → SurfaceView
 Android touch → 同じTCP接続 → niri virtual pointer
 ```
@@ -48,11 +48,9 @@ git push origin v0.1.0
 処理されます。LCDのリフレッシュレートを明示的に切り替えないため、再び動いた時のモード切替
 待ちも入りません。
 
-この実機では1920x1080@60の静止時に約1 fps（compositor側の更新を含む）、`wf-recorder`
-約0.5% CPUでした。動きがある時だけ必要なfpsまで上がります。
-
-`auto` encoderはまずVA-API + DMA-BUFを試し、起動直後に失敗した場合はx264へフォールバック
-します。明示的に固定する場合は`--encoder vaapi`または`--encoder x264`を使います。
+エンコードは低遅延x264へ固定し、wf-recorderのDMA-BUFキャプチャは常に無効化します。映像履歴や
+GPU共有バッファを蓄積せず、上限付きの共有メモリバッファを循環再利用します。静止時はdamageが
+発生した時だけ処理し、動きがある時だけ必要なfpsまで上がります。
 
 ## NixOSで常用する
 
@@ -88,8 +86,8 @@ flakeのNixOS moduleはVKMSとユーザーサービスをまとめて設定し�
 services.niri-android-monitor.users = [ "alice" "bob" ];
 ```
 
-NixOS側ではサービスの有効化とデスクトップユーザーだけを指定します。解像度、fps、encoder、
-ADB serial、output名、render node、タッチ入力などの実際の設定はGUIから行います。GUIで保存した
+NixOS側ではサービスの有効化とデスクトップユーザーだけを指定します。解像度、fps、ADB serial、
+output名、タッチ入力などの実際の設定はGUIから行います。GUIで保存した
 `~/.config/niri-android-monitor/settings.json`がNix moduleの初期値より優先されるため、設定変更の
 たびにNixOSをrebuildする必要はありません。
 
@@ -113,16 +111,15 @@ GUIではデーモンを停止せずに、以下を変更できます。
 
 - niri output名
 - 任意の幅・高さ・最大fps
-- Auto / VA-API / x264 encoder
 - ADB serial
 - タッチ入力
-- render nodeと明示的なcustom mode
+- 明示的なcustom mode
 
 設定は`~/.config/niri-android-monitor/settings.json`へ保存されます。NixOS moduleやコマンドライン
 引数は初期値として扱われ、「Restore Nix defaults」で保存した上書きを削除できます。
 
 GUIとデーモンは`$XDG_RUNTIME_DIR/niri-android-monitor.sock`で通信します。socketはmode 0600で、
-同じユーザーだけが操作できます。解像度・fps・encoderなどを適用すると、デーモンのsystemd
+同じユーザーだけが操作できます。解像度・fpsなどを適用すると、デーモンのsystemd
 serviceは維持したまま現在の映像セッションだけを終了します。Androidアプリが自動再接続し、
 通常は約1秒以内に新しい設定へ切り替わります。
 
@@ -164,7 +161,7 @@ nix run . -- \
 ```
 
 解像度とfpsは任意に変更できます。`--mode`を省略すると
-`WIDTHxHEIGHT@FPS`がniri custom modeとして使われます。出力名、mode、encoderなど全引数は
+`WIDTHxHEIGHT@FPS`がniri custom modeとして使われます。出力名、modeなど全引数は
 `nix run . -- --help`で確認できます。ADB reverseは待機中に2秒間隔で再適用されるため、USBを
 抜き差ししてもデーモンの再起動は不要です。
 
@@ -205,7 +202,7 @@ receive-to-decode時間を使って、バッファ詰まりや欠落を切り分
 
 - Xiaomi Pad 6S Pro (`24018RPACG`, Android 16)、USB/ADB reverse
 - Qualcomm hardware H.264 decoder + low-latency mode
-- AMD VA-API + DMA-BUF
-- 1920x1080@60、静止時約1 fps / `wf-recorder`約0.5% CPU
-- 1本指tap・連続swipeのuinput転送
+- DMA-BUFを使わない共有メモリキャプチャ + low-latency x264
+- 1920x1080@60、damage駆動VFR
+- 1本指tap・連続swipeのniri virtual pointer転送
 - アプリ終了およびSIGINT時の`Virtual-1`自動OFF

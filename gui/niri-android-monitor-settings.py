@@ -11,7 +11,6 @@ from gi.repository import GLib, Gtk
 
 
 APP_ID = "dev.niri.androidmonitor.Settings"
-ENCODERS = ["auto", "vaapi", "x264"]
 
 
 def control_socket_path():
@@ -94,17 +93,14 @@ class SettingsWindow(Gtk.ApplicationWindow):
         self.fps_spin = Gtk.SpinButton.new_with_range(1, 240, 1)
         self._row(grid, 2, "Maximum FPS", self.fps_spin)
 
-        self.encoder_dropdown = Gtk.DropDown.new_from_strings(ENCODERS)
-        self._row(grid, 3, "encoder", self.encoder_dropdown)
-
         self.adb_entry = Gtk.Entry()
         self.adb_entry.set_placeholder_text("Leave empty to use the only connected device")
         self.adb_entry.set_hexpand(True)
-        self._row(grid, 4, "ADB serial", self.adb_entry)
+        self._row(grid, 3, "ADB serial", self.adb_entry)
 
         self.touch_switch = Gtk.Switch()
         self.touch_switch.set_halign(Gtk.Align.START)
-        self._row(grid, 5, "Touch input", self.touch_switch)
+        self._row(grid, 4, "Touch input", self.touch_switch)
 
         advanced = Gtk.Expander(label="Advanced settings")
         advanced_grid = Gtk.Grid(column_spacing=16, row_spacing=12)
@@ -112,14 +108,10 @@ class SettingsWindow(Gtk.ApplicationWindow):
         advanced.set_child(advanced_grid)
         outer.append(advanced)
 
-        self.render_entry = Gtk.Entry()
-        self.render_entry.set_hexpand(True)
-        self._row(advanced_grid, 0, "render node", self.render_entry)
-
         self.mode_entry = Gtk.Entry()
         self.mode_entry.set_placeholder_text("Leave empty for WIDTHxHEIGHT@FPS")
         self.mode_entry.set_hexpand(True)
-        self._row(advanced_grid, 1, "custom mode", self.mode_entry)
+        self._row(advanced_grid, 0, "custom mode", self.mode_entry)
 
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         buttons.set_halign(Gtk.Align.END)
@@ -170,11 +162,8 @@ class SettingsWindow(Gtk.ApplicationWindow):
         self.width_spin.set_value(settings["width"])
         self.height_spin.set_value(settings["height"])
         self.fps_spin.set_value(settings["fps"])
-        encoder = settings.get("encoder", "auto")
-        self.encoder_dropdown.set_selected(ENCODERS.index(encoder) if encoder in ENCODERS else 0)
         self.adb_entry.set_text(settings.get("adb_serial") or "")
         self.touch_switch.set_active(bool(settings.get("touch", True)))
-        self.render_entry.set_text(settings.get("render_node", "/dev/dri/renderD128"))
         mode = settings.get("mode", "")
         derived = f'{settings["width"]}x{settings["height"]}@{settings["fps"]}'
         self.mode_entry.set_text("" if mode == derived else mode)
@@ -188,10 +177,8 @@ class SettingsWindow(Gtk.ApplicationWindow):
             width=self.width_spin.get_value_as_int(),
             height=self.height_spin.get_value_as_int(),
             fps=self.fps_spin.get_value_as_int(),
-            encoder=ENCODERS[self.encoder_dropdown.get_selected()],
             adb_serial=self.adb_entry.get_text().strip() or None,
             touch=self.touch_switch.get_active(),
-            render_node=self.render_entry.get_text().strip(),
             mode=self.mode_entry.get_text().strip(),
         )
         return updated

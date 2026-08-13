@@ -1,3 +1,4 @@
+use rustix::process::{Pid, Signal, kill_process};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -25,7 +26,11 @@ const MAGIC: &[u8; 4] = b"NAMD";
 const PROTOCOL_VERSION: u16 = 2;
 const STREAM_FLAG_TOUCH: u16 = 1;
 const MAX_ACCESS_UNIT_SIZE: usize = 16 * 1024 * 1024;
+const MAX_ANNEX_B_BUFFER_SIZE: usize = MAX_ACCESS_UNIT_SIZE + 64 * 1024;
 const CONTROL_MESSAGE_SIZE: usize = 16;
+const RECORDER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const RECORDER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const OUTPUT_RELEASE_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -37,8 +42,6 @@ struct Config {
     fps: u32,
     port: u16,
     adb_serial: Option<String>,
-    encoder: String,
-    render_node: String,
     touch: bool,
 }
 
@@ -49,9 +52,6 @@ impl Config {
         }
         if self.fps > 240 {
             return Err("fps must be 240 or lower".into());
-        }
-        if !matches!(self.encoder.as_str(), "auto" | "vaapi" | "x264") {
-            return Err("encoder must be auto, vaapi, or x264".into());
         }
         if self.output.trim().is_empty() {
             return Err("output must not be empty".into());
@@ -102,8 +102,6 @@ impl Default for Config {
             fps: 60,
             port: 57421,
             adb_serial: env::var("ANDROID_SERIAL").ok(),
-            encoder: "auto".into(),
-            render_node: "/dev/dri/renderD128".into(),
             touch: true,
         }
     }
@@ -216,15 +214,12 @@ fn parse_args() -> io::Result<Config> {
             "--fps" => config.fps = parse(&value(&mut args, "--fps")?, "fps")?,
             "--port" => config.port = parse(&value(&mut args, "--port")?, "port")?,
             "--adb-serial" => config.adb_serial = Some(value(&mut args, "--adb-serial")?),
-            "--encoder" => config.encoder = value(&mut args, "--encoder")?,
-            "--render-node" => config.render_node = value(&mut args, "--render-node")?,
             "--no-touch" => config.touch = false,
             "--help" | "-h" => {
                 println!(
                     r#"niri-android-monitor [--output Virtual-1] [--mode 1920x1080@60] \
                      [--width 1920] [--height 1080] [--fps 60] [--port 57421] \
-                     [--adb-serial SERIAL] [--encoder auto|vaapi|x264] \
-                     [--render-node /dev/dri/renderD128] [--no-touch]"#
+                     [--adb-serial SERIAL] [--no-touch]"#
                 );
                 std::process::exit(0);
             }
@@ -515,7 +510,7 @@ fn serve(
             None
         });
     write_header(&mut stream, config, touch.is_some())?;
-    let (mut recorder, active_encoder) = spawn_recorder(config)?;
+    let mut recorder = spawn_recorder(config)?;
     let stdout = recorder
         .stdout
         .take()
@@ -527,7 +522,7 @@ fn serve(
         status.active_width = Some(config.width);
         status.active_height = Some(config.height);
         status.active_fps = Some(config.fps);
-        status.active_encoder = Some(active_encoder);
+        status.active_encoder = Some("x264".into());
     }
 
     let control_stream = stream.try_clone()?;
@@ -546,6 +541,9 @@ fn serve(
     let result = forward_access_units(BufReader::new(stdout), &mut stream, &shared);
     let _ = stream.shutdown(Shutdown::Both);
     let _ = control.join();
+    // Give niri time to process wf-recorder's Wayland disconnect and release
+    // its capture buffers before removing the output they belonged to.
+    thread::sleep(OUTPUT_RELEASE_GRACE);
     result
 }
 
@@ -560,79 +558,46 @@ fn write_header(stream: &mut TcpStream, config: &Config, touch_enabled: bool) ->
     stream.flush()
 }
 
-fn spawn_recorder(config: &Config) -> io::Result<(Child, String)> {
-    if config.encoder == "auto" && Path::new(&config.render_node).exists() {
-        eprintln!("trying vaapi encoder on {}", config.render_node);
-        let mut child = spawn_encoder(config, "vaapi")?;
-        thread::sleep(Duration::from_millis(150));
-        if let Some(status) = child.try_wait()? {
-            eprintln!("vaapi exited early ({status}); falling back to x264");
-            return spawn_encoder(config, "x264").map(|child| (child, "x264".into()));
-        }
-        return Ok((child, "vaapi".into()));
-    }
-
-    let encoder = if config.encoder == "auto" {
-        "x264"
-    } else {
-        config.encoder.as_str()
-    };
-    eprintln!("using {encoder} encoder");
-    spawn_encoder(config, encoder).map(|child| (child, encoder.into()))
+fn spawn_recorder(config: &Config) -> io::Result<Child> {
+    eprintln!("using x264 encoder with shared-memory capture");
+    encoder_command(config).spawn()
 }
 
-fn spawn_encoder(config: &Config, encoder: &str) -> io::Result<Child> {
+fn encoder_command(config: &Config) -> Command {
     let mut command = Command::new("wf-recorder");
     command.args([
         "-o",
         &config.output,
+        // DMA-BUF capture can leave shared AMD GPU buffers resident in niri
+        // after the recorder exits. Use bounded, reusable shared-memory
+        // capture buffers on the Wayland side instead.
+        "--no-dmabuf",
         // -B tells wf-recorder the maximum capture rate while retaining
         // damage-driven VFR. Unlike -r, it does not duplicate static frames.
         "-B",
         &config.fps.to_string(),
     ]);
 
-    if encoder == "vaapi" {
-        command.args([
-            "-c",
-            "h264_vaapi",
-            "-d",
-            &config.render_node,
-            "-b",
-            "0",
-            "-p",
-            "aud=1",
-            "-p",
-            &format!("g={}", config.fps),
-            "-p",
-            "rc_mode=CQP",
-            "-p",
-            "qp=20",
-        ]);
-    } else {
-        let x264_params = format!(
-            "aud=1:repeat-headers=1:keyint={}:min-keyint={}:scenecut=0",
-            config.fps, config.fps
-        );
-        command.args([
-            "-c",
-            "libx264",
-            "-b",
-            "0",
-            "-p",
-            "preset=ultrafast",
-            "-p",
-            "tune=zerolatency",
-            "-p",
-            &format!("x264-params={x264_params}"),
-        ]);
-    }
+    let x264_params = format!(
+        "aud=1:repeat-headers=1:keyint={}:min-keyint={}:scenecut=0",
+        config.fps, config.fps
+    );
+    command.args([
+        "-c",
+        "libx264",
+        "-b",
+        "0",
+        "-p",
+        "preset=ultrafast",
+        "-p",
+        "tune=zerolatency",
+        "-p",
+        &format!("x264-params={x264_params}"),
+    ]);
 
+    command.args(["-m", "h264", "-y", "-f", "/dev/stdout"]);
+    command.stdout(Stdio::piped()).stderr(Stdio::inherit());
     command
-        .args(["-m", "h264", "-y", "-f", "/dev/stdout"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -788,9 +753,36 @@ fn control_loop(
     if let Some(client) = touch.as_mut() {
         let _ = client.release_button(0);
     }
+    stop_recorder(recorder);
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
+fn stop_recorder(recorder: &mut Child) {
+    match recorder.try_wait() {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(error) => eprintln!("could not query wf-recorder before shutdown: {error}"),
+    }
+
+    if let Err(error) = kill_process(Pid::from_child(recorder), Signal::INT) {
+        eprintln!("could not ask wf-recorder to stop gracefully: {error}");
+    }
+
+    let deadline = Instant::now() + RECORDER_SHUTDOWN_TIMEOUT;
+    while Instant::now() < deadline {
+        match recorder.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(RECORDER_SHUTDOWN_POLL_INTERVAL),
+            Err(error) => {
+                eprintln!("could not wait for wf-recorder shutdown: {error}");
+                break;
+            }
+        }
+    }
+
+    eprintln!("wf-recorder did not stop after SIGINT; forcing termination");
     let _ = recorder.kill();
     let _ = recorder.wait();
-    let _ = stream.shutdown(Shutdown::Both);
 }
 
 struct TouchMessage {
@@ -953,7 +945,7 @@ fn forward_access_units<R: Read>(
             }
             return Ok(());
         }
-        parser.push(&chunk[..count]);
+        parser.push(&chunk[..count])?;
         while let Some(nal) = parser.next_nal() {
             consume_nal(
                 nal,
@@ -1092,8 +1084,15 @@ struct AnnexBParser {
 }
 
 impl AnnexBParser {
-    fn push(&mut self, data: &[u8]) {
+    fn push(&mut self, data: &[u8]) -> io::Result<()> {
+        if self.buffer.len().saturating_add(data.len()) > MAX_ANNEX_B_BUFFER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "H.264 parser buffer exceeded its 16 MiB limit",
+            ));
+        }
         self.buffer.extend_from_slice(data);
+        Ok(())
     }
 
     fn next_nal(&mut self) -> Option<Vec<u8>> {
@@ -1122,15 +1121,37 @@ mod tests {
     #[test]
     fn splits_annex_b_across_chunks() {
         let mut parser = AnnexBParser::default();
-        parser.push(&[0, 0]);
+        parser.push(&[0, 0]).unwrap();
         assert!(parser.next_nal().is_none());
-        parser.push(&[0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x67, 1]);
+        parser
+            .push(&[0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x67, 1])
+            .unwrap();
         let first = parser.next_nal().unwrap();
         assert_eq!(nal_type(&first), Some(9));
-        parser.push(&[2, 0, 0, 1, 0x68, 3]);
+        parser.push(&[2, 0, 0, 1, 0x68, 3]).unwrap();
         let second = parser.next_nal().unwrap();
         assert_eq!(nal_type(&second), Some(7));
         assert_eq!(nal_type(&parser.finish().unwrap()), Some(8));
+    }
+
+    #[test]
+    fn rejects_an_unbounded_annex_b_buffer() {
+        let mut parser = AnnexBParser::default();
+        let error = parser
+            .push(&vec![0xff; MAX_ANNEX_B_BUFFER_SIZE + 1])
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(parser.buffer.is_empty());
+    }
+
+    #[test]
+    fn recorder_capture_never_uses_dmabuf() {
+        let command = encoder_command(&Config::default());
+        let args: Vec<_> = command.get_args().collect();
+        assert!(args.iter().any(|arg| *arg == "--no-dmabuf"));
+        assert!(args.iter().any(|arg| *arg == "libx264"));
+        assert!(!args.iter().any(|arg| *arg == "h264_vaapi"));
+        assert!(args.windows(2).any(|args| args == ["-f", "/dev/stdout"]));
     }
 
     #[test]

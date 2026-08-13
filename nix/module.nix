@@ -11,8 +11,6 @@ let
     "--width" (toString cfg.width)
     "--height" (toString cfg.height)
     "--fps" (toString cfg.fps)
-    "--encoder" cfg.encoder
-    "--render-node" cfg.renderNode
   ]
   ++ optional (cfg.adbSerial != null) "--adb-serial"
   ++ optional (cfg.adbSerial != null) cfg.adbSerial
@@ -93,18 +91,6 @@ in
       type = types.nullOr types.str;
       default = null;
       description = "Optional Android ADB serial when more than one device is attached.";
-    };
-
-    encoder = mkOption {
-      type = types.enum [ "auto" "vaapi" "x264" ];
-      default = "auto";
-      description = "H.264 encoder selection.";
-    };
-
-    renderNode = mkOption {
-      type = types.str;
-      default = "/dev/dri/renderD128";
-      description = "DRM render node used by VA-API.";
     };
 
     touch.enable = mkOption {

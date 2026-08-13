@@ -21,8 +21,8 @@ import java.io.BufferedInputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.Socket
-import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -33,6 +33,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var surfaceView: SurfaceView
     private lateinit var statusView: TextView
     private var receiver: StreamReceiver? = null
+    private var forwardingTouch = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -42,17 +43,40 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         surfaceView = SurfaceView(this).also { view ->
             view.holder.addCallback(this)
             view.setOnTouchListener { touched, event ->
-                val action = when (event.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> TOUCH_DOWN
-                    MotionEvent.ACTION_MOVE -> TOUCH_MOVE
-                    MotionEvent.ACTION_UP -> TOUCH_UP
-                    MotionEvent.ACTION_CANCEL -> TOUCH_CANCEL
-                    else -> return@setOnTouchListener true
-                }
                 val index = event.actionIndex.coerceAtMost(event.pointerCount - 1)
-                val x = (event.getX(index) / touched.width.coerceAtLeast(1)).coerceIn(0f, 1f)
-                val y = (event.getY(index) / touched.height.coerceAtLeast(1)).coerceIn(0f, 1f)
-                receiver?.sendTouch(action, x, y, event.eventTime.toInt())
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        forwardingTouch = receiver?.sendTouch(
+                            TOUCH_DOWN,
+                            event.getX(index),
+                            event.getY(index),
+                            touched.width,
+                            touched.height,
+                            event.eventTime.toInt(),
+                        ) == true
+                    }
+                    MotionEvent.ACTION_MOVE -> if (forwardingTouch) {
+                        receiver?.sendTouch(
+                            TOUCH_MOVE,
+                            event.getX(index),
+                            event.getY(index),
+                            touched.width,
+                            touched.height,
+                            event.eventTime.toInt(),
+                        )
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> if (forwardingTouch) {
+                        receiver?.sendTouch(
+                            if (event.actionMasked == MotionEvent.ACTION_UP) TOUCH_UP else TOUCH_CANCEL,
+                            event.getX(index),
+                            event.getY(index),
+                            touched.width,
+                            touched.height,
+                            event.eventTime.toInt(),
+                        )
+                        forwardingTouch = false
+                    }
+                }
                 true
             }
         }
@@ -98,6 +122,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun stopReceiver() {
+        forwardingTouch = false
         receiver?.close()
         receiver = null
     }
@@ -118,7 +143,7 @@ private class StreamReceiver(
     private val receiveTimes = ConcurrentHashMap<Long, Long>()
     private val decodedFrames = AtomicLong()
     private val decodeNanoseconds = AtomicLong()
-    private val controlQueue = ArrayBlockingQueue<ControlPacket>(64)
+    private val controlQueue = LinkedBlockingDeque<ControlPacket>(64)
     private var socket: Socket? = null
     private var codec: MediaCodec? = null
     @Volatile private var controlOutput: DataOutputStream? = null
@@ -171,11 +196,23 @@ private class StreamReceiver(
         stopCodec()
     }
 
-    fun sendTouch(action: Int, x: Float, y: Float, eventTimeMs: Int) {
-        if (!touchEnabled) return
+    fun sendTouch(
+        action: Int,
+        viewX: Float,
+        viewY: Float,
+        viewWidth: Int,
+        viewHeight: Int,
+        eventTimeMs: Int,
+    ): Boolean {
+        if (!touchEnabled) return false
+        // VIDEO_SCALING_MODE_SCALE_TO_FIT stretches the decoded frame to the
+        // Surface dimensions, so touch uses the same full-view transform.
+        val x = (viewX / viewWidth.coerceAtLeast(1)).coerceIn(0f, 1f)
+        val y = (viewY / viewHeight.coerceAtLeast(1)).coerceIn(0f, 1f)
         enqueueControl(
             ControlPacket(CONTROL_TOUCH, action, x.toRawBits(), y.toRawBits(), eventTimeMs),
         )
+        return true
     }
 
     private fun sendStats(decodeMs: Float, effectiveFps: Float, decoded: Int) {
@@ -185,11 +222,21 @@ private class StreamReceiver(
     }
 
     private fun enqueueControl(packet: ControlPacket) {
-        if (!controlQueue.offer(packet)) {
-            // If the USB writer ever falls behind, discard an old move instead
-            // of adding input latency. A 64-event queue is normally empty.
-            controlQueue.poll()
-            controlQueue.offer(packet)
+        synchronized(controlQueue) {
+            // Keep at most one unsent move. Boundary events (down/up/cancel)
+            // must never be displaced by a long, high-refresh-rate swipe.
+            if (packet.isTouchMove()) {
+                controlQueue.firstOrNull { it.isTouchMove() }?.let(controlQueue::remove)
+            }
+            if (controlQueue.offerLast(packet)) return
+
+            val disposable = controlQueue.firstOrNull {
+                it.isTouchMove() || it.type == CONTROL_STATS
+            }
+            if (disposable != null) {
+                controlQueue.remove(disposable)
+                controlQueue.offerLast(packet)
+            }
         }
     }
 
@@ -391,4 +438,6 @@ private data class ControlPacket(
     val first: Int,
     val second: Int,
     val extra: Int,
-)
+) {
+    fun isTouchMove(): Boolean = type == 1 && action == 1
+}

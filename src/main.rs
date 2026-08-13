@@ -6,7 +6,6 @@ use std::env;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixDatagram;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -14,6 +13,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use wayland_client::globals::{GlobalListContents, registry_queue_init};
+use wayland_client::protocol::{wl_pointer, wl_registry};
+use wayland_client::{Connection, Dispatch, QueueHandle};
+use wayland_protocols_wlr::virtual_pointer::v1::client::{
+    zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
+    zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
+};
 
 const MAGIC: &[u8; 4] = b"NAMD";
 const PROTOCOL_VERSION: u16 = 2;
@@ -22,7 +28,7 @@ const MAX_ACCESS_UNIT_SIZE: usize = 16 * 1024 * 1024;
 const CONTROL_MESSAGE_SIZE: usize = 16;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 struct Config {
     output: String,
     mode: String,
@@ -34,7 +40,6 @@ struct Config {
     encoder: String,
     render_node: String,
     touch: bool,
-    ydotool_socket: PathBuf,
 }
 
 impl Config {
@@ -100,9 +105,6 @@ impl Default for Config {
             encoder: "auto".into(),
             render_node: "/dev/dri/renderD128".into(),
             touch: true,
-            ydotool_socket: env::var_os("YDOTOOL_SOCKET")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| "/run/ydotoold/socket".into()),
         }
     }
 }
@@ -216,17 +218,13 @@ fn parse_args() -> io::Result<Config> {
             "--adb-serial" => config.adb_serial = Some(value(&mut args, "--adb-serial")?),
             "--encoder" => config.encoder = value(&mut args, "--encoder")?,
             "--render-node" => config.render_node = value(&mut args, "--render-node")?,
-            "--ydotool-socket" => {
-                config.ydotool_socket = value(&mut args, "--ydotool-socket")?.into()
-            }
             "--no-touch" => config.touch = false,
             "--help" | "-h" => {
                 println!(
                     r#"niri-android-monitor [--output Virtual-1] [--mode 1920x1080@60] \
                      [--width 1920] [--height 1080] [--fps 60] [--port 57421] \
                      [--adb-serial SERIAL] [--encoder auto|vaapi|x264] \
-                     [--render-node /dev/dri/renderD128] \
-                     [--ydotool-socket /run/ydotoold/socket] [--no-touch]"#
+                     [--render-node /dev/dri/renderD128] [--no-touch]"#
                 );
                 std::process::exit(0);
             }
@@ -507,8 +505,16 @@ fn serve(
     niri_output(&config.output, &["on"])?;
     thread::sleep(Duration::from_millis(250));
 
-    let geometry = query_output_geometry(config);
-    write_header(&mut stream, config)?;
+    let pointer_space = query_pointer_space(config);
+    let touch = config
+        .touch
+        .then(|| WaylandPointer::connect(pointer_space))
+        .transpose()
+        .unwrap_or_else(|error| {
+            eprintln!("touch forwarding unavailable: {error}");
+            None
+        });
+    write_header(&mut stream, config, touch.is_some())?;
     let (mut recorder, active_encoder) = spawn_recorder(config)?;
     let stdout = recorder
         .stdout
@@ -525,14 +531,12 @@ fn serve(
     }
 
     let control_stream = stream.try_clone()?;
-    let touch_socket = config.touch.then(|| config.ydotool_socket.clone());
     let control_shared = Arc::clone(&shared);
     let control = thread::spawn(move || {
         control_loop(
             control_stream,
             &mut recorder,
-            geometry,
-            touch_socket,
+            touch,
             stopping,
             control_shared,
             session_revision,
@@ -545,8 +549,8 @@ fn serve(
     result
 }
 
-fn write_header(stream: &mut TcpStream, config: &Config) -> io::Result<()> {
-    let flags = if config.touch { STREAM_FLAG_TOUCH } else { 0 };
+fn write_header(stream: &mut TcpStream, config: &Config, touch_enabled: bool) -> io::Result<()> {
+    let flags = if touch_enabled { STREAM_FLAG_TOUCH } else { 0 };
     stream.write_all(MAGIC)?;
     stream.write_all(&PROTOCOL_VERSION.to_be_bytes())?;
     stream.write_all(&flags.to_be_bytes())?;
@@ -631,66 +635,111 @@ fn spawn_encoder(config: &Config, encoder: &str) -> io::Result<Child> {
         .spawn()
 }
 
-#[derive(Clone, Copy, Debug)]
-struct OutputGeometry {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rectangle {
     x: i32,
     y: i32,
     width: u32,
     height: u32,
 }
 
-fn query_output_geometry(config: &Config) -> OutputGeometry {
-    let fallback = OutputGeometry {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PointerSpace {
+    output: Rectangle,
+    desktop: Rectangle,
+}
+
+impl PointerSpace {
+    fn project(&self, x: f32, y: f32) -> (u32, u32, u32, u32) {
+        let target_x = i64::from(self.output.x)
+            + (x.clamp(0.0, 1.0) * self.output.width.saturating_sub(1) as f32).round() as i64;
+        let target_y = i64::from(self.output.y)
+            + (y.clamp(0.0, 1.0) * self.output.height.saturating_sub(1) as f32).round() as i64;
+        let x = u32::try_from(target_x - i64::from(self.desktop.x)).unwrap_or(0);
+        let y = u32::try_from(target_y - i64::from(self.desktop.y)).unwrap_or(0);
+        (
+            x.min(self.desktop.width.saturating_sub(1)),
+            y.min(self.desktop.height.saturating_sub(1)),
+            self.desktop.width,
+            self.desktop.height,
+        )
+    }
+}
+
+fn query_pointer_space(config: &Config) -> PointerSpace {
+    let fallback = Rectangle {
         x: 0,
         y: 0,
         width: config.width,
         height: config.height,
     };
     let Ok(output) = Command::new("niri").args(["msg", "-j", "outputs"]).output() else {
-        return fallback;
+        return PointerSpace {
+            output: fallback,
+            desktop: fallback,
+        };
     };
     let Ok(json) = serde_json::from_slice::<Value>(&output.stdout) else {
-        return fallback;
+        return PointerSpace {
+            output: fallback,
+            desktop: fallback,
+        };
     };
-    let Some(logical) = json
+    let output = json
         .get(&config.output)
         .and_then(|value| value.get("logical"))
-    else {
-        return fallback;
-    };
-    let number = |name: &str| logical.get(name).and_then(Value::as_i64);
-    OutputGeometry {
-        x: number("x").and_then(|n| i32::try_from(n).ok()).unwrap_or(0),
-        y: number("y").and_then(|n| i32::try_from(n).ok()).unwrap_or(0),
-        width: number("width")
-            .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(config.width),
-        height: number("height")
-            .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(config.height),
-    }
+        .and_then(parse_rectangle)
+        .unwrap_or(fallback);
+
+    let logical_outputs: Vec<_> = json
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, value)| value.get("logical"))
+        .filter_map(parse_rectangle)
+        .collect();
+    let desktop = bounding_rectangle(&logical_outputs).unwrap_or(output);
+    PointerSpace { output, desktop }
+}
+
+fn parse_rectangle(value: &Value) -> Option<Rectangle> {
+    let number = |name: &str| value.get(name).and_then(Value::as_i64);
+    Some(Rectangle {
+        x: i32::try_from(number("x")?).ok()?,
+        y: i32::try_from(number("y")?).ok()?,
+        width: u32::try_from(number("width")?).ok()?.max(1),
+        height: u32::try_from(number("height")?).ok()?.max(1),
+    })
+}
+
+fn bounding_rectangle(rectangles: &[Rectangle]) -> Option<Rectangle> {
+    let min_x = rectangles.iter().map(|rect| i64::from(rect.x)).min()?;
+    let min_y = rectangles.iter().map(|rect| i64::from(rect.y)).min()?;
+    let max_x = rectangles
+        .iter()
+        .map(|rect| i64::from(rect.x) + i64::from(rect.width))
+        .max()?;
+    let max_y = rectangles
+        .iter()
+        .map(|rect| i64::from(rect.y) + i64::from(rect.height))
+        .max()?;
+    Some(Rectangle {
+        x: i32::try_from(min_x).ok()?,
+        y: i32::try_from(min_y).ok()?,
+        width: u32::try_from(max_x - min_x).ok()?.max(1),
+        height: u32::try_from(max_y - min_y).ok()?.max(1),
+    })
 }
 
 fn control_loop(
     mut stream: TcpStream,
     recorder: &mut Child,
-    geometry: OutputGeometry,
-    socket_path: Option<PathBuf>,
+    mut touch: Option<WaylandPointer>,
     stopping: Arc<AtomicBool>,
     shared: Arc<SharedState>,
     session_revision: u64,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-    let mut touch = socket_path.and_then(|path| match YdotoolClient::connect(&path) {
-        Ok(client) => {
-            eprintln!("touch forwarding enabled via {}", path.display());
-            Some(client)
-        }
-        Err(error) => {
-            eprintln!("touch forwarding unavailable ({}): {error}", path.display());
-            None
-        }
-    });
     let mut message = [0u8; CONTROL_MESSAGE_SIZE];
     let mut filled = 0;
 
@@ -705,7 +754,8 @@ fn control_loop(
                     match message[0] {
                         1 => {
                             if let Some(client) = touch.as_mut()
-                                && let Err(error) = client.handle(&message, geometry)
+                                && let Some(message) = TouchMessage::parse(&message)
+                                && let Err(error) = client.handle(message)
                             {
                                 eprintln!("touch event failed: {error}");
                             }
@@ -736,96 +786,129 @@ fn control_loop(
     }
 
     if let Some(client) = touch.as_mut() {
-        let _ = client.release_button();
+        let _ = client.release_button(0);
     }
     let _ = recorder.kill();
     let _ = recorder.wait();
     let _ = stream.shutdown(Shutdown::Both);
 }
 
-struct YdotoolClient {
-    socket: UnixDatagram,
+struct TouchMessage {
+    action: u8,
+    x: f32,
+    y: f32,
+    time: u32,
+}
+
+impl TouchMessage {
+    fn parse(message: &[u8; CONTROL_MESSAGE_SIZE]) -> Option<Self> {
+        if message[0] != 1 {
+            return None;
+        }
+        let x = f32::from_bits(u32::from_be_bytes(message[4..8].try_into().unwrap()));
+        let y = f32::from_bits(u32::from_be_bytes(message[8..12].try_into().unwrap()));
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        Some(Self {
+            action: message[1],
+            x: x.clamp(0.0, 1.0),
+            y: y.clamp(0.0, 1.0),
+            time: u32::from_be_bytes(message[12..16].try_into().unwrap()),
+        })
+    }
+}
+
+struct WaylandState;
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandState {
+    fn event(
+        _: &mut Self,
+        _: &wl_registry::WlRegistry,
+        _: wl_registry::Event,
+        _: &GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwlrVirtualPointerManagerV1, ()> for WaylandState {
+    fn event(
+        _: &mut Self,
+        _: &ZwlrVirtualPointerManagerV1,
+        _: wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwlrVirtualPointerV1, ()> for WaylandState {
+    fn event(
+        _: &mut Self,
+        _: &ZwlrVirtualPointerV1,
+        _: wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+struct WaylandPointer {
+    connection: Connection,
+    pointer: ZwlrVirtualPointerV1,
+    space: PointerSpace,
     button_down: bool,
 }
 
-impl YdotoolClient {
-    fn connect(path: &Path) -> io::Result<Self> {
-        let socket = UnixDatagram::unbound()?;
-        socket.connect(path)?;
+impl WaylandPointer {
+    fn connect(space: PointerSpace) -> io::Result<Self> {
+        let connection = Connection::connect_to_env().map_err(io::Error::other)?;
+        let (globals, event_queue) =
+            registry_queue_init::<WaylandState>(&connection).map_err(io::Error::other)?;
+        let queue_handle = event_queue.handle();
+        let manager: ZwlrVirtualPointerManagerV1 = globals
+            .bind(&queue_handle, 1..=2, ())
+            .map_err(io::Error::other)?;
+        let pointer = manager.create_virtual_pointer(None, &queue_handle, ());
+        connection.flush().map_err(io::Error::other)?;
+        eprintln!("touch forwarding enabled via niri virtual pointer");
         Ok(Self {
-            socket,
+            connection,
+            pointer,
+            space,
             button_down: false,
         })
     }
 
-    fn handle(
-        &mut self,
-        message: &[u8; CONTROL_MESSAGE_SIZE],
-        geometry: OutputGeometry,
-    ) -> io::Result<()> {
-        if message[0] != 1 {
-            return Ok(());
-        }
-        let action = message[1];
-        let x =
-            f32::from_bits(u32::from_be_bytes(message[4..8].try_into().unwrap())).clamp(0.0, 1.0);
-        let y =
-            f32::from_bits(u32::from_be_bytes(message[8..12].try_into().unwrap())).clamp(0.0, 1.0);
-        if !x.is_finite() || !y.is_finite() {
-            return Ok(());
-        }
-        let target_x = geometry
-            .x
-            .saturating_add((x * geometry.width.saturating_sub(1) as f32).round() as i32);
-        let target_y = geometry
-            .y
-            .saturating_add((y * geometry.height.saturating_sub(1) as f32).round() as i32);
-        self.move_absolute(target_x, target_y)?;
+    fn handle(&mut self, message: TouchMessage) -> io::Result<()> {
+        let (x, y, width, height) = self.space.project(message.x, message.y);
+        self.pointer
+            .motion_absolute(message.time, x, y, width, height);
 
-        match action {
+        match message.action {
             0 if !self.button_down => {
-                self.send_events(&[(1, 0x110, 1), (0, 0, 0)])?;
+                self.pointer
+                    .button(message.time, 0x110, wl_pointer::ButtonState::Pressed);
                 self.button_down = true;
             }
-            2 | 3 if self.button_down => self.release_button()?,
+            2 | 3 if self.button_down => self.release_button(message.time)?,
             _ => {}
         }
-        Ok(())
+        self.pointer.frame();
+        self.connection.flush().map_err(io::Error::other)
     }
 
-    fn move_absolute(&self, x: i32, y: i32) -> io::Result<()> {
-        self.send_events(&[
-            (2, 0, i32::MIN),
-            (2, 1, i32::MIN),
-            (2, 0, x),
-            (2, 1, y),
-            (0, 0, 0),
-        ])
-    }
-
-    fn release_button(&mut self) -> io::Result<()> {
+    fn release_button(&mut self, time: u32) -> io::Result<()> {
         if self.button_down {
-            self.send_events(&[(1, 0x110, 0), (0, 0, 0)])?;
+            self.pointer
+                .button(time, 0x110, wl_pointer::ButtonState::Released);
+            self.pointer.frame();
+            self.connection.flush().map_err(io::Error::other)?;
             self.button_down = false;
-        }
-        Ok(())
-    }
-
-    fn send_events(&self, events: &[(u16, u16, i32)]) -> io::Result<()> {
-        for (event_type, code, value) in events {
-            let mut packet = Vec::with_capacity(24);
-            packet.extend_from_slice(&[0; 16]); // timeval; ydotoold ignores it.
-            packet.extend_from_slice(&event_type.to_ne_bytes());
-            packet.extend_from_slice(&code.to_ne_bytes());
-            packet.extend_from_slice(&value.to_ne_bytes());
-            // ydotoold receives exactly one input_event per datagram.
-            let sent = self.socket.send(&packet)?;
-            if sent != packet.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "short ydotool send",
-                ));
-            }
         }
         Ok(())
     }
@@ -1064,5 +1147,72 @@ mod tests {
             f32::from_bits(u32::from_be_bytes(message[8..12].try_into().unwrap())),
             0.75
         );
+    }
+
+    #[test]
+    fn virtual_pointer_projects_into_the_full_desktop() {
+        let space = PointerSpace {
+            output: Rectangle {
+                x: 1920,
+                y: -200,
+                width: 1280,
+                height: 800,
+            },
+            desktop: Rectangle {
+                x: -640,
+                y: -200,
+                width: 3840,
+                height: 1280,
+            },
+        };
+        assert_eq!(space.project(0.0, 0.0), (2560, 0, 3840, 1280));
+        assert_eq!(space.project(1.0, 1.0), (3839, 799, 3840, 1280));
+    }
+
+    #[test]
+    fn output_bounds_include_negative_positions() {
+        let bounds = bounding_rectangle(&[
+            Rectangle {
+                x: -100,
+                y: 50,
+                width: 100,
+                height: 200,
+            },
+            Rectangle {
+                x: 300,
+                y: -20,
+                width: 50,
+                height: 70,
+            },
+        ]);
+        assert_eq!(
+            bounds,
+            Some(Rectangle {
+                x: -100,
+                y: -20,
+                width: 450,
+                height: 270,
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a running unrestricted Wayland compositor"]
+    fn virtual_pointer_protocol_is_available() {
+        let space = PointerSpace {
+            output: Rectangle {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            desktop: Rectangle {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+        };
+        WaylandPointer::connect(space).unwrap();
     }
 }

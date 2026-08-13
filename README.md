@@ -5,7 +5,7 @@ USB-connected Android deviceを、niriの低遅延サブモニターとして使
 ```text
 VKMS / niri output → wlr-screencopy DMA-BUF → VA-API H.264
                  → ADB reverse → MediaCodec → SurfaceView
-Android touch → 同じTCP接続 → ydotoold → uinput → niri
+Android touch → 同じTCP接続 → niri virtual pointer
 ```
 
 niri本体への変更と物理ダミープラグは不要です。VKMS connectorはカーネルに登録したままにし、
@@ -56,7 +56,7 @@ git push origin v0.1.0
 
 ## NixOSで常用する
 
-flakeのNixOS moduleはVKMS、ydotoold、ユーザーサービスをまとめて設定します。
+flakeのNixOS moduleはVKMSとユーザーサービスをまとめて設定します。
 
 ```nix
 {
@@ -93,8 +93,8 @@ ADB serial、output名、render node、タッチ入力などの実際の設定�
 `~/.config/niri-android-monitor/settings.json`がNix moduleの初期値より優先されるため、設定変更の
 たびにNixOSをrebuildする必要はありません。
 
-rebuild後は、ydotool groupを反映するため一度ログアウト・ログインしてください。ユーザーサービスは
-niri IPC socketを待ってから起動し、最初に`Virtual-1`をOFFにします。Androidアプリが閉じている
+ユーザーサービスはniri IPC socketを待ってから起動し、最初に`Virtual-1`をOFFにします。
+Androidアプリが閉じている
 時の`niri msg -j outputs`では`current_mode`と`logical`がともに`null`になります。
 
 VKMSだけを管理したい場合は、従来どおり`nixosModules.vkms`と
@@ -170,14 +170,15 @@ nix run . -- \
 
 ## Touch
 
-現状は1本指をabsolute mouseとして扱います。
+1本指をabsolute mouseとして扱います。niriのWayland virtual pointerへdesktop全体の
+絶対座標を直接送るため、マウス加速の影響を受けません。
 
 - down: ポインター移動 + 左ボタンdown
 - move: absolute pointer移動
 - up/cancel: 左ボタンup
 
-タッチ座標は接続時のniri logical output位置へ変換されます。接続が切れた場合も左ボタンを必ず
-releaseします。タッチを使わない場合は`--no-touch`またはNix option
+タッチ座標はAndroidの映像Surfaceから、接続時のniri logical output位置へ変換されます。接続が
+切れた場合も左ボタンを必ずreleaseします。タッチを使わない場合は`--no-touch`またはNix option
 `touch.enable = false`を指定します。
 
 ## 計測

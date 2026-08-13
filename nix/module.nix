@@ -3,7 +3,7 @@
 
 let
   cfg = config.services.niri-android-monitor;
-  inherit (lib) genAttrs mkEnableOption mkIf mkOption optional optionals types;
+  inherit (lib) mkEnableOption mkIf mkOption optional optionals types;
   effectiveUsers = if cfg.user != null then [ cfg.user ] else cfg.users;
   executable = lib.getExe cfg.package;
   arguments = [
@@ -110,7 +110,7 @@ in
     touch.enable = mkOption {
       type = types.bool;
       default = true;
-      description = "Forward Android touch as absolute mouse input through ydotoold.";
+      description = "Forward Android touch through niri's virtual pointer.";
     };
   };
 
@@ -127,11 +127,6 @@ in
     ];
     services.niri-android-vkms.enable = true;
     environment.systemPackages = [ cfg.package ];
-
-    programs.ydotool.enable = cfg.touch.enable;
-    users.users = genAttrs effectiveUsers (_: {
-      extraGroups = optional cfg.touch.enable config.programs.ydotool.group;
-    });
 
     systemd.user.services.niri-android-monitor = {
       description = "Low-latency Android monitor for niri";
